@@ -14,7 +14,8 @@ After researching every major option across 5 dimensions (language, data store, 
 │  Database:          PostgreSQL + TimescaleDB + AGE +      │
 │                     pgvector                              │
 │  Cache:             Valkey (Redis-compatible)              │
-│  LLM:               Claude (Anthropic Go SDK)             │
+│  LLM:               Provider-agnostic (Claude/Ollama/vLLM/ │
+│                     llama.cpp/LocalAI/any OpenAI-compat)  │
 │  Frontend:          React + Next.js + shadcn/ui           │
 │  Topology Viz:      Cytoscape.js                          │
 │  Workflow Viz:      React Flow                            │
@@ -97,17 +98,69 @@ Edge Agents (embedded, zero-ops)
 
 ---
 
-## Decision 3: LLM Integration — Claude as Core Engine
+## Decision 3: LLM Integration — Provider-Agnostic with Local-First Support
+
+**LOOM must NEVER be dependent on any single cloud LLM API.** The LLM engine is designed as a provider-agnostic abstraction that connects to ANY compatible backend — cloud APIs, local models, or hybrid.
 
 ### Architecture
 
 ```
-LOOM LLM Engine
-  ├── Claude Opus/Sonnet  → Complex reasoning (placement, anomaly correlation, oversight detection)
-  ├── Claude Haiku        → Routine decisions (protocol selection, config validation)
-  ├── On-prem models      → Air-gapped environments (Llama/Mistral via Ollama)
-  └── MCP Servers         → Tool integration (infrastructure adapters as MCP tools)
+LOOM LLM Engine (Provider-Agnostic)
+  │
+  ├── LLM Router / Gateway
+  │   ├── Selects provider based on: availability, cost, latency, task complexity
+  │   ├── Automatic failover: cloud unavailable → local model
+  │   └── Policy enforcement: "production configs MUST use local models only"
+  │
+  ├── Cloud Providers (optional, not required)
+  │   ├── Anthropic Claude (Opus/Sonnet/Haiku)
+  │   ├── OpenAI GPT-4o / o-series
+  │   ├── Google Gemini
+  │   └── Any OpenAI-compatible API
+  │
+  ├── Local Model Frameworks (first-class, not fallback)
+  │   ├── Ollama         → Simplest local deployment, 100+ models, REST API
+  │   ├── vLLM           → Production serving (19x faster than Ollama at scale)
+  │   ├── llama.cpp      → CPU-only inference, no GPU required
+  │   ├── LocalAI        → OpenAI-compatible API for any local model
+  │   ├── LM Studio      → Desktop GUI + API server
+  │   ├── text-generation-inference (TGI) → HuggingFace production serving
+  │   └── ExLlamaV2      → Optimized quantized inference
+  │
+  ├── Recommended Local Models
+  │   ├── Llama 4 Scout (8B/70B)  → Best open-weights general reasoning
+  │   ├── DeepSeek-V3             → GPT-4-level, fully open weights
+  │   ├── Qwen 2.5 (7B/14B/72B)  → Strong for structured output / config generation
+  │   ├── Mistral Large / Small   → Good balance of speed and quality
+  │   ├── CodeLlama / DeepSeek-Coder → For config generation tasks
+  │   └── Fine-tuned domain models → Network config specialists (7B-14B)
+  │
+  └── MCP Servers → Tool integration (infrastructure adapters as MCP tools)
 ```
+
+### Provider-Agnostic Design Principles
+
+1. **No cloud dependency** — LOOM must function fully with only local models. Cloud APIs are an enhancement, not a requirement.
+2. **Unified interface** — All providers (Claude, GPT, Ollama, vLLM, llama.cpp) are accessed through a single Go interface. Adapters translate to each provider's API.
+3. **OpenAI-compatible API as common protocol** — Most local frameworks (Ollama, vLLM, LocalAI, LM Studio) expose an OpenAI-compatible API. LOOM's gateway speaks this protocol natively, making any compatible backend plug-and-play.
+4. **Per-task routing** — Different tasks can use different providers: local SLM for config validation, cloud API for complex planning (if available), fine-tuned local model for vendor-specific configs.
+5. **Deployment modes**:
+   - **Air-gapped**: Local models only (Ollama/vLLM + Llama/DeepSeek/Qwen). Zero external network calls.
+   - **Hybrid**: Local models for routine + cloud APIs for complex reasoning. Automatic failover.
+   - **Cloud-assisted**: Cloud APIs primary with local fallback.
+6. **Model hot-swap** — Switch models at runtime without restart. A/B test local vs cloud models on real traffic.
+
+### Hardware Requirements for Local Models
+
+| Model Size | VRAM Required | Example Hardware | Throughput |
+|-----------|---------------|-----------------|------------|
+| 7B (4-bit) | 4-6 GB | Any modern GPU, Apple M-series | 30-50 tokens/s |
+| 14B (4-bit) | 8-10 GB | RTX 3090/4090, M2 Pro | 20-35 tokens/s |
+| 70B (4-bit) | 35-40 GB | A100 40GB, 2x RTX 4090 | 10-20 tokens/s |
+| 70B (8-bit) | 70-80 GB | A100 80GB, H100 | 15-25 tokens/s |
+| CPU-only (7B) | 8 GB RAM | Any server, no GPU | 5-10 tokens/s |
+
+**Minimum viable local deployment**: A single machine with 16GB RAM can run a 7B model via llama.cpp on CPU. No GPU required. This is sufficient for config validation, protocol selection, and basic reasoning.
 
 ### Key Patterns
 
@@ -134,10 +187,12 @@ LLM generates config
 
 ### Cost Optimization
 
-- Haiku for 80% of decisions (routine, pattern-matched) — ~$0.002/decision
-- Opus for 20% of decisions (complex, novel) — ~$0.10/decision
+- **Local models for 80% of decisions** — $0/decision (hardware amortization only)
+- Cloud API for 20% of complex decisions (if connected) — ~$0.10/decision
 - Semantic caching reduces calls 20-50%
-- Estimated: **$15-40/day at 1000 decisions/day**
+- **Air-gapped cost: $0/day** (hardware only, no per-token fees)
+- **Hybrid cost: ~$5-20/day** at 1000 decisions/day (80% local, 20% cloud)
+- **Cloud-only cost: ~$15-40/day** at 1000 decisions/day
 
 ---
 
@@ -220,7 +275,10 @@ Temporal handles workflow orchestration. NATS handles everything else:
                          │                       │
                          │  ┌─────────────────┐  │
                          │  │  LLM Engine     │  │
-                         │  │  (Anthropic SDK) │  │
+                         │  │ (provider-agno- │  │
+                         │  │ stic: Claude /  │  │
+                         │  │ Ollama / vLLM / │  │
+                         │  │ llama.cpp /any) │  │
                          │  └────────┬────────┘  │
                          │           │           │
                          │  ┌────────▼────────┐  │
@@ -273,7 +331,27 @@ temporal-server                 # Workflow engine (uses same PostgreSQL)
 
 ### Air-Gapped / On-Prem
 
-All components run as native binaries or containers. No cloud dependencies. LLM falls back to on-prem models (Ollama + Llama/Mistral) when Claude API is unreachable.
+All components run as native binaries or containers. **Zero cloud dependencies.**
+
+LLM in air-gapped mode:
+```bash
+# Option 1: Ollama (simplest)
+ollama serve                          # Starts local model server
+ollama pull llama4:8b                 # Download model once, runs forever offline
+
+# Option 2: vLLM (production, GPU)
+vllm serve meta-llama/Llama-4-8B     # High-throughput serving
+
+# Option 3: llama.cpp (CPU-only, no GPU needed)
+./llama-server -m model.gguf         # Runs on any hardware
+
+# LOOM connects to any of these via OpenAI-compatible API
+LOOM_LLM_ENDPOINT=http://localhost:11434/v1  # Ollama
+LOOM_LLM_ENDPOINT=http://localhost:8000/v1   # vLLM
+LOOM_LLM_ENDPOINT=http://localhost:8080/v1   # llama.cpp
+```
+
+**No internet required. No API keys required. No cloud accounts required.**
 
 ---
 
