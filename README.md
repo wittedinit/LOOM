@@ -56,6 +56,7 @@ LOOM doesn't replace Kubernetes, Terraform, Ansible, or any tool that already do
 
 ## Documentation
 
+- **[Implementation Plan](docs/IMPLEMENTATION-PLAN.md)** — 12-phase roadmap from contracts to production (v3, AI-reviewed)
 - **[Architecture](docs/ARCHITECTURE.md)** — System design, adapter layer, LLM decision engine
 - **[Tech Stack](docs/TECH-STACK.md)** — Language, database, LLM, workflow engine, and UI decisions with rationale
 - **[Competitive Analysis](docs/COMPETITIVE-ANALYSIS.md)** — 100+ tools analyzed across 10 domains
