@@ -217,7 +217,7 @@ type DNSResolutionCheck struct {
 ## Anti-Patterns
 
 - **Do not verify inside the main activity.** Verification is always a separate activity.
-- **Do not skip verification for "simple" operations.** Every side effect gets verified.
+- **Do not skip verification for "simple" forward operations.** Every forward side effect gets verified. Compensation steps are exempt from individual verification -- they are verified by the final state check after all compensations complete (see WORKFLOW-CONTRACT.md principle 4).
 - **Do not use verification as monitoring.** Verification runs once per workflow, not continuously.
 - **Do not store expected outcomes after the fact.** Expected outcomes are declared at submission, before execution begins.
 - **Do not summarize evidence.** Store the raw adapter response. Summaries lose forensic value.

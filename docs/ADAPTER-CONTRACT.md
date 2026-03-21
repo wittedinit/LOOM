@@ -268,7 +268,15 @@ Every operation carries an `IdempotencyKey` (UUID). Adapters must honor it.
 2. If the same `IdempotencyKey` is submitted and the operation is in progress: wait for completion and return the result.
 3. If the `IdempotencyKey` has never been seen: execute normally.
 
-Adapters maintain an idempotency cache with a configurable TTL. The orchestrator is responsible for generating unique keys and retrying with the same key on transient failures.
+Adapters maintain an idempotency cache with a configurable TTL. Idempotency cache TTL MUST be at least 2x the maximum operation timeout. Default: idempotency keys are cached for 24 hours. If the TTL is shorter than the operation timeout, the same operation could execute twice.
+
+The orchestrator is responsible for generating unique keys and retrying with the same key on transient failures.
+
+### Retry Ownership Rule
+
+**Adapters MUST NOT retry.** Retry logic is exclusively owned by the Temporal activity retry policy (defined in ERROR-MODEL.md). Adapters perform exactly ONE attempt per call and return errors immediately. A `TransientError` return signals the workflow layer to retry according to its retry policy.
+
+This prevents retry amplification: if adapters retried 3 times internally and Temporal retried 5 times externally, a single failure could cause up to 15 actual attempts against the target device. Instead, Temporal controls the total retry count, backoff, and timeout budget for the entire operation.
 
 ---
 
@@ -277,25 +285,109 @@ Adapters maintain an idempotency cache with a configurable TTL. The orchestrator
 Every `Executor` must declare for each operation type whether it is compensatable, and if so, what the reverse operation is.
 
 ```go
+// CompensationReliability declares how reliably an adapter can undo a mutation.
+// This is per-adapter (not per-operation) because reliability is a property of
+// the protocol and device, not the logical operation.
+type CompensationReliability string
+
+const (
+    // CompReliabilityTransactional — the device supports atomic rollback.
+    // Examples: NETCONF candidate/running with confirmed-commit, Junos rollback,
+    // vSphere snapshot-revert, Proxmox snapshot-revert.
+    // Compensation is guaranteed to restore exact pre-op state.
+    CompReliabilityTransactional CompensationReliability = "transactional"
+
+    // CompReliabilitySnapshotRestore — the adapter takes a full config snapshot
+    // before any mutation and can restore it on failure. Not atomic, but the
+    // restore target is the exact pre-op config, not a generic reverse.
+    // Examples: SSH adapter dumps running-config before change, restores on failure.
+    CompReliabilitySnapshotRestore CompensationReliability = "snapshot_restore"
+
+    // CompReliabilityBestEffort — the adapter can attempt a reverse operation,
+    // but there is no guarantee it restores the exact pre-op state.
+    // Examples: IPMI power-off to compensate power-on (but original state may
+    // have been "on"), eAPI VLAN delete to compensate VLAN create.
+    CompReliabilityBestEffort CompensationReliability = "best_effort"
+
+    // CompReliabilityNone — no programmatic undo is possible. The device or
+    // protocol does not support rollback, snapshot, or reliable reverse operations.
+    // Examples: MikroTik REST (no transactions, server-assigned IDs),
+    // SSH raw command execution, legacy Cisco IOS without archive/rollback.
+    // Workflows targeting these adapters MUST flag this before execution and
+    // require explicit human acknowledgment.
+    CompReliabilityNone CompensationReliability = "none"
+)
+
 // CompensationInfo describes how to reverse an operation.
 type CompensationInfo struct {
     Reversible     bool
-    CompensationOp OperationType // the reverse operation type, or "" if not reversible
+    CompensationOp OperationType           // the reverse operation type, or "" if not reversible
+    Reliability    CompensationReliability  // how reliably this compensation restores pre-op state
 }
 ```
 
+### Pre-Operation Snapshots
+
+Adapters that support `CompReliabilitySnapshotRestore` or `CompReliabilityTransactional` must implement the `SnapshotCapable` interface. This is checked at workflow planning time.
+
+```go
+// SnapshotCapable is implemented by adapters that can capture device config
+// state before a mutation. The orchestrator calls TakeSnapshot before any
+// mutating operation and stores the result for potential restoration.
+type SnapshotCapable interface {
+    // TakeSnapshot captures the current config state of the target.
+    // The returned ConfigSnapshot is opaque to the orchestrator — only the
+    // originating adapter knows how to interpret and restore it.
+    TakeSnapshot(ctx context.Context, scope SnapshotScope) (*ConfigSnapshot, error)
+
+    // RestoreSnapshot restores the device to a previously captured state.
+    // This is called during saga compensation when the adapter's
+    // CompensationReliability is snapshot_restore or transactional.
+    RestoreSnapshot(ctx context.Context, snapshot *ConfigSnapshot) error
+}
+
+// SnapshotScope defines what to capture.
+type SnapshotScope struct {
+    ResourceRefs []ResourceRef // specific resources, or empty for full config
+    Format       string        // "running_config", "candidate_config", "full_state"
+}
+
+// ConfigSnapshot is the captured state. Opaque to the orchestrator.
+type ConfigSnapshot struct {
+    AdapterName string    // which adapter produced this snapshot
+    DeviceID    string    // LOOM internal device ID
+    Scope       SnapshotScope
+    Data        []byte    // adapter-specific serialized state
+    Format      string    // "text/plain", "application/json", "application/xml"
+    Checksum    string    // SHA-256 of Data for integrity verification
+    CapturedAt  time.Time
+}
+```
+
+### Workflow Behavior for CompensationReliability = None
+
+When a workflow targets a device whose adapter declares `CompReliabilityNone`:
+
+1. **Pre-execution check**: The workflow planner inspects all target adapters. If any adapter has `CompReliabilityNone`, the workflow is flagged as `requires_acknowledgment`.
+2. **Human acknowledgment required**: The workflow will not execute until the operator explicitly acknowledges: "I understand that rollback is not possible for device X. Manual intervention may be required if this workflow fails."
+3. **Acknowledgment is a Temporal signal**, consistent with the approval gate pattern in WORKFLOW-CONTRACT.md.
+4. **On failure**: The workflow enters `compensation_partial` state. Steps targeting adapters with reliable compensation are rolled back normally. Steps targeting `CompReliabilityNone` adapters are logged with full context (what was changed, what the pre-op state was if a snapshot was taken manually, and what the operator needs to do to restore it).
+
 **Examples:**
 
-| Operation | Compensation |
-|-----------|-------------|
-| PowerOnOp | PowerOffOp |
-| PowerOffOp | PowerOnOp |
-| CreateVLANOp | DeleteVLANOp |
-| DeleteVLANOp | CreateVLANOp (with original params) |
-| ConfigurePortOp | ConfigurePortOp (with previous config) |
-| ExecuteCommandOp | CompensationNone (commands are not generically reversible) |
-| ReadSensorsOp | CompensationNone (read-only) |
-| ReadInterfacesOp | CompensationNone (read-only) |
+| Operation | Compensation | Reliability |
+|-----------|-------------|-------------|
+| PowerOnOp | PowerOffOp | best_effort (original state unknown) |
+| PowerOffOp | PowerOnOp | best_effort (original state unknown) |
+| CreateVLANOp (NETCONF) | DeleteVLANOp | transactional (candidate commit) |
+| CreateVLANOp (eAPI) | DeleteVLANOp | best_effort (no atomic rollback) |
+| CreateVLANOp (MikroTik) | manual delete by `.id` | none (server-assigned IDs) |
+| ConfigurePortOp (NETCONF) | RestoreSnapshot | snapshot_restore |
+| ConfigurePortOp (SSH) | RestoreSnapshot | snapshot_restore (if config dump supported) |
+| DeleteVLANOp | CreateVLANOp (with original params) | best_effort |
+| ExecuteCommandOp (SSH) | CompensationNone | none |
+| ReadSensorsOp | CompensationNone (read-only) | n/a |
+| ReadInterfacesOp | CompensationNone (read-only) | n/a |
 
 The orchestrator uses compensation info to build rollback plans when multi-step workflows fail partway through.
 

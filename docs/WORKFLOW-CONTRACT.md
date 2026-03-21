@@ -7,7 +7,7 @@
 1. **Temporal is the execution source of truth.** PostgreSQL is a searchable projection and reporting layer. If Temporal and the DB disagree, Temporal wins.
 2. **One workflow step = one meaningful business action.** A step is not a micro-activity. "Provision server" is a step. "Set hostname" is an activity within that step.
 3. **One activity = one retryable side effect.** An activity wraps exactly one adapter call plus its verification. Nothing else.
-4. **Verification is mandatory.** Every side-effecting activity has a corresponding verification activity. Verification is never optional, never skippable, never folded into the main activity.
+4. **Verification is mandatory for forward operations.** Every side-effecting forward activity has a corresponding verification activity. Verification is never optional, never skippable, never folded into the main activity. Compensation operations are verified by the final state check after all compensations complete, not individually. Individual compensation steps emit AUDIT events but do not require verification checks.
 5. **Compensation is explicit.** Where rollback is needed, compensation is its own activity with its own timeout and retry policy.
 6. **Every workflow declares `ExpectedOutcome` at submission.** Verification activities use this to determine pass/fail. No expected outcome, no workflow execution.
 7. **Approval gates use Temporal signals.** Never polling. A workflow blocks on a signal; the approval service sends the signal when a human or policy engine decides.

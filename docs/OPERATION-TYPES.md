@@ -221,6 +221,29 @@ type SetACLResult struct {
 
 ---
 
+### RemoveACLOp
+
+Remove an access control list from an interface.
+
+```go
+type RemoveACLParams struct {
+    InterfaceName string // interface to remove the ACL from
+    Direction     string // "in", "out"
+    RuleID        *int   // specific rule sequence number to remove, nil = remove entire ACL
+    RuleName      string // ACL name to remove (required when RuleID is nil)
+}
+
+type RemoveACLResult struct {
+    Removed    bool
+    RulesCount int // remaining rules after removal (0 if entire ACL removed)
+}
+```
+
+- **Compensation:** `SetACLOp` with the original ACL name, rules, interface, and direction.
+- **Adapters:** NETCONF, gNMI, eAPI, NX-API.
+
+---
+
 ### ReadSensorsOp
 
 Read hardware sensors: temperature, voltage, fan speed.
@@ -406,6 +429,14 @@ var OperationTypes = map[OperationType]OperationTypeInfo{
         OutputType: reflect.TypeOf(SetACLResult{}),
         Compensation: CompensationInfo{Reversible: true, CompensationOp: "remove_acl"},
         Description: "Apply an access control list to an interface",
+        ReadOnly:    false,
+    },
+    "remove_acl": {
+        Name:       "remove_acl",
+        ParamsType: reflect.TypeOf(RemoveACLParams{}),
+        OutputType: reflect.TypeOf(RemoveACLResult{}),
+        Compensation: CompensationInfo{Reversible: true, CompensationOp: "set_acl"},
+        Description: "Remove an access control list from an interface",
         ReadOnly:    false,
     },
     "read_sensors": {

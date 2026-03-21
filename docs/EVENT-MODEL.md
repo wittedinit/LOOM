@@ -174,7 +174,7 @@ var LoomEventStream = &nats.StreamConfig{
     Subjects:    []string{"loom.>"},
     Retention:   nats.LimitsPolicy,     // retain by limits (age + size)
     MaxAge:      90 * 24 * time.Hour,   // 90 days retention
-    MaxBytes:    50 * 1024 * 1024 * 1024, // 50 GB max
+    MaxBytes:    100 * 1024 * 1024 * 1024, // 100 GB default (see sizing note below)
     Storage:     nats.FileStorage,       // persist to disk
     Replicas:    3,                       // 3-way replication for durability
     Discard:     nats.DiscardOld,        // discard oldest when limits hit
@@ -182,6 +182,8 @@ var LoomEventStream = &nats.StreamConfig{
     MaxMsgSize:  1 * 1024 * 1024,        // 1 MB max message size
 }
 ```
+
+**MaxBytes Sizing:** MaxBytes should be calculated as: `estimated_events_per_day x avg_event_size x retention_days x 1.5 safety_margin`. The default of 100GB is appropriate for deployments up to 10K devices with 90-day retention. Operators should monitor stream usage (`nats stream info LOOM_EVENTS`) and adjust MaxBytes before the stream approaches capacity, since `DiscardOld` will silently drop events that have not yet reached MaxAge.
 
 ### Consumer Patterns
 
