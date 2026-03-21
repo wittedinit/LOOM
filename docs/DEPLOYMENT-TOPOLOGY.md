@@ -58,11 +58,15 @@ pg_ctl start -D /var/lib/postgresql/data
 
 # Start LOOM — everything else is embedded
 ./loom serve \
-  --db "postgres://loom:secret@localhost:5432/loom?sslmode=disable" \
+  --db "postgres://loom:secret@localhost:5432/loom?sslmode=verify-full" \
   --nats-embedded \
   --temporal-embedded \
   --llm-endpoint "http://localhost:11434/v1"   # Ollama, or omit for cloud
 ```
+
+> **TLS in Mode 1:** On first run, if no TLS certificate is configured, LOOM auto-generates a self-signed CA and server certificate under `~/.loom/certs/`. This ensures that even development deployments use TLS for the API and PostgreSQL connections. The self-signed CA is printed to stdout so operators can trust it in their browser or client tooling. For production, replace with a proper CA-signed certificate.
+
+> **Security note:** `sslmode=disable` is never acceptable, even in development. The default is `sslmode=verify-full`. LOOM refuses to start if `sslmode=disable` is detected in the database connection string.
 
 **What "embedded" means:**
 - **NATS**: The Go NATS server library (`github.com/nats-io/nats-server/v2/server`) supports

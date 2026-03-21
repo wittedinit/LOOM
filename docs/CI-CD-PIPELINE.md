@@ -38,6 +38,9 @@ build:
       with:
         go-version-file: go.mod
 
+    # Module integrity verification — ensures downloaded modules match go.sum
+    - run: go mod verify
+
     # Compilation
     - run: go build ./...
 
@@ -164,8 +167,14 @@ security:
     - run: go list -m -json all | go install github.com/sonatype-nexus-community/nancy@latest && nancy sleuth
 
     # SBOM generation — Software Bill of Materials
+    # Pinned version with SHA-256 checksum verification (no curl | sh)
     - run: |
-        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+        SYFT_VERSION="1.18.1"
+        SYFT_SHA256="a]b2c3d4e5f6...pin-actual-hash-here"  # Update on version bump
+        curl -sSfL -o syft.tar.gz "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+        echo "${SYFT_SHA256}  syft.tar.gz" | sha256sum -c -
+        tar -xzf syft.tar.gz -C /usr/local/bin syft
+        rm syft.tar.gz
         syft . -o spdx-json > sbom.spdx.json
     - uses: actions/upload-artifact@v4
       with:
@@ -173,8 +182,14 @@ security:
         path: sbom.spdx.json
 
     # Container image scanning (if building container)
+    # Pinned version with SHA-256 checksum verification (no curl | sh)
     - run: |
-        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+        TRIVY_VERSION="0.58.1"
+        TRIVY_SHA256="e5f6a7b8c9d0...pin-actual-hash-here"  # Update on version bump
+        curl -sSfL -o trivy.tar.gz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+        echo "${TRIVY_SHA256}  trivy.tar.gz" | sha256sum -c -
+        tar -xzf trivy.tar.gz -C /usr/local/bin trivy
+        rm trivy.tar.gz
         trivy image --severity HIGH,CRITICAL --exit-code 1 loom:${{ github.sha }}
 ```
 
@@ -324,13 +339,15 @@ Feature flags are stored in PostgreSQL and evaluated per-tenant. This allows:
 All release binaries are signed using [cosign](https://github.com/sigstore/cosign) (keyless, Sigstore-backed):
 
 ```bash
-# Verify a LOOM binary
+# Verify a LOOM binary — exact repo identity match (no regexp wildcards)
 cosign verify-blob \
   --signature loom_0.3.0_linux_amd64.tar.gz.sig \
-  --certificate-identity-regexp ".*github.com/.*" \
+  --certificate-identity "https://github.com/loomprojekt/loom/.github/workflows/release.yml@refs/tags/v0.3.0" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   loom_0.3.0_linux_amd64.tar.gz
 ```
+
+> **Security note:** Always use `--certificate-identity` with the exact workflow path and tag ref, not `--certificate-identity-regexp`. A regexp like `.*github.com/.*` would accept signatures from **any** GitHub Actions workflow, defeating supply chain verification.
 
 ### Container Images
 

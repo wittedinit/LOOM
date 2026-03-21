@@ -1232,6 +1232,52 @@ func TestTenantIsolation(t *testing.T) {
 
 ---
 
+## Detection Gaps and Monitoring Requirements
+
+The following detection gaps were identified during adversarial security audit and must be addressed with dedicated monitoring capabilities. These requirements complement the operational observability defined in [OBSERVABILITY-STRATEGY.md](OBSERVABILITY-STRATEGY.md).
+
+### Auth Failure Monitoring
+
+Authentication failures must be tracked per source IP, failure reason, and tenant. The `loom_auth_failures_total{source, reason, tenant_id}` metric (defined in OBSERVABILITY-STRATEGY.md) feeds a Grafana alert that fires when the 5-minute failure rate exceeds 10 attempts. Failed authentication events must also be written to the immutable audit log with full context (source IP, user agent, attempted identity, failure reason). Repeated failures from a single source must trigger automatic temporary blocking at the API gateway layer.
+
+### Credential Access Profiling per Adapter
+
+Each adapter has a baseline credential access pattern (e.g., Redfish adapter accesses BMC credentials at discovery time and during health checks). The `loom_credential_access_total{tenant_id, credential_ref, actor}` metric enables profiling of normal access patterns per adapter. Deviations from baseline (e.g., an SSH adapter suddenly accessing Redfish credentials, or any adapter accessing credentials outside its normal schedule) must generate alerts. Baseline profiles are computed from a 7-day rolling window and stored in Valkey.
+
+### Edge Agent Behavioral Anomaly Detection
+
+Edge agents report heartbeats, telemetry rates, and command execution patterns to the hub. The `loom_adapter_anomaly_score{adapter_name, device_id}` gauge tracks a per-adapter anomaly score computed from:
+- Command execution frequency deviation from baseline.
+- Unusual protocol usage (e.g., agent suddenly using IPMI when it only uses Redfish).
+- Credential access patterns that diverge from the agent's configured adapter set.
+- Network traffic volume anomalies (reported via agent self-metrics).
+
+An anomaly score above 0.8 triggers an alert. An anomaly score above 0.95 triggers automatic quarantine of the edge agent (hub stops sending commands until manual review).
+
+### Device-Side Mutual Authentication
+
+Where supported by device firmware, LOOM should configure mutual TLS for device connections:
+- **Redfish**: Use client certificate authentication where BMC firmware supports it (Dell iDRAC 9+, HPE iLO 5+).
+- **NETCONF**: Require mutual TLS for all NETCONF sessions (RFC 7589).
+- **gNMI**: Require mutual TLS (standard gNMI practice).
+- **SSH**: Use Ed25519 host key verification with known_hosts pinning. Rotate device SSH host keys on a schedule.
+- **IPMI/SNMP**: These protocols lack meaningful mutual authentication. Compensating control: restrict IPMI/SNMP traffic to a dedicated management VLAN with strict ACLs, and prefer Redfish where available.
+
+Device identity verification status is tracked per device in the `device_auth_status` field (values: `mutual_tls`, `server_only`, `password_only`, `unverified`).
+
+### Security Event Bus
+
+Security-critical events must flow through a dedicated high-priority NATS subject namespace (`loom.security.*`) that is separate from operational events. This channel must **not** be subject to operational backpressure — if the operational event stream is congested or slow, security events must still be delivered promptly.
+
+Implementation requirements:
+- Dedicated NATS stream `LOOM_SECURITY` with `MaxAge=90d` and `Replicas=3`.
+- Separate consumer group for the security event processor (not shared with operational consumers).
+- Security events include: auth failures, authz denials, tenant boundary violations, credential access anomalies, break-glass usage, certificate expiry warnings, and adapter anomaly alerts.
+- The security event stream feeds both the Prometheus alerting pipeline and an external SIEM integration (via NATS → webhook bridge or direct SIEM connector).
+- Backpressure on the operational `LOOM_EVENTS` stream must never delay or drop messages on `LOOM_SECURITY`.
+
+---
+
 ## References
 
 - `VAULT-ARCHITECTURE.md` — Full vault implementation details, key ceremony procedures, backup/restore
