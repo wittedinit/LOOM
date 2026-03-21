@@ -1,8 +1,9 @@
 # Research: Edge Agent Security Model
 
-> **Status:** Open — requires design decisions before Phase 1A
+> **Status:** Resolved — all design decisions made, specification written
 > **Addresses:** GAP-ANALYSIS.md findings C1, C4, C5
-> **Owner:** TBD
+> **Specification:** [EDGE-AGENT-SECURITY-SPEC.md](EDGE-AGENT-SECURITY-SPEC.md)
+> **Owner:** Security Architecture
 > **Last updated:** 2026-03-21
 
 ---
@@ -89,12 +90,14 @@ These gaps affect the foundational trust model of every edge deployment.
 - On agent decommission: hub marks all distributed credentials for rotation, revokes agent certificate
 - Credential cache has a configurable maximum offline duration (default: 7 days). After expiry, cached credentials are wiped and the agent enters degraded mode (monitoring only, no mutations)
 
-### 2.5 Open Questions
+### 2.5 Resolved Questions
 
-- [ ] Is TPM 2.0 a hard requirement for edge agents, or is it a recommended enhancement?
-- [ ] What is the minimum viable local encryption for agents without TPM (passphrase-derived KEK)?
-- [ ] Should credential cache wipe be time-based, or event-based (e.g., wipe if tamper detection triggers)?
-- [ ] How does the hub authenticate the agent's credential requests to prevent a rogue agent from fetching credentials for a different site?
+> All questions resolved in [EDGE-AGENT-SECURITY-SPEC.md](EDGE-AGENT-SECURITY-SPEC.md) Section 2.
+
+- [x] Is TPM 2.0 a hard requirement for edge agents, or is it a recommended enhancement? **Decision: RECOMMENDED, not required. Fallback: Argon2id passphrase-derived KEK.**
+- [x] What is the minimum viable local encryption for agents without TPM (passphrase-derived KEK)? **Decision: Argon2id (time=3, memory=256MiB, threads=4, keyLen=32) with passphrase delivered via systemd LoadCredential.**
+- [x] Should credential cache wipe be time-based, or event-based (e.g., wipe if tamper detection triggers)? **Decision: Both. Time-based (7-day max offline duration) AND event-based (TPM PCR mismatch, integrity hash failure, hub-initiated revocation).**
+- [x] How does the hub authenticate the agent's credential requests to prevent a rogue agent from fetching credentials for a different site? **Decision: mTLS with SiteID in certificate SAN (URI: loom://site/{site_id}/agent/{agent_id}). Hub extracts SiteID from cert and enforces scope.**
 
 ---
 
@@ -166,12 +169,14 @@ Rollback:
 - Hub can issue a "rollback" command that triggers fleet-wide revert to previous version
 ```
 
-### 3.6 Open Questions
+### 3.6 Resolved Questions
 
-- [ ] Is TUF acceptable complexity for Phase 1, or should a simpler scheme (multi-sig + staged rollout without TUF) ship first?
-- [ ] Where are root keys stored? Hardware security module (HSM), or offline on air-gapped machine?
-- [ ] What is the minimum health check for canary validation? (agent boots + hub connectivity + 1 device reachable?)
-- [ ] Should air-gapped environments use a different update mechanism (USB-delivered TUF repo)?
+> All questions resolved in [EDGE-AGENT-SECURITY-SPEC.md](EDGE-AGENT-SECURITY-SPEC.md) Section 3.
+
+- [x] Is TUF acceptable complexity for Phase 1, or should a simpler scheme (multi-sig + staged rollout without TUF) ship first? **Decision: TUF is accepted. Complexity is borne by the CI/release pipeline, not the edge agent. The go-tuf v2 client library is mature. TUF integration ships in Phase 1B.**
+- [x] Where are root keys stored? Hardware security module (HSM), or offline on air-gapped machine? **Decision: Air-gapped machine, ceremony-based rotation. Root keys on a dedicated laptop stored in a safe. Each of the 3 targets signing keys on a YubiKey 5 NFC.**
+- [x] What is the minimum health check for canary validation? (agent boots + hub connectivity + 1 device reachable?) **Decision: Yes, all three conditions within 5 minutes: boot success + hub NATS connectivity + at least one managed device reachable (ICMP/SNMP/Redfish).**
+- [x] Should air-gapped environments use a different update mechanism (USB-delivered TUF repo)? **Decision: Yes, USB-delivered TUF repository. The agent's TUF client verifies the same metadata chain regardless of transport. Hub imports the USB repo via `loom admin update import`.**
 
 ---
 
@@ -274,13 +279,15 @@ Rollback:
 └──────────────────────────────────────────────────┘
 ```
 
-### 4.5 Open Questions
+### 4.5 Resolved Questions
 
-- [ ] Should reconciliation be automatic or always require human approval?
-- [ ] What is the disk spill strategy for P0 events that exceed memory? (Write to local SQLite?)
-- [ ] How does the reconciliation protocol interact with Temporal? (New workflow? Signal to existing?)
-- [ ] Should the edge agent maintain a local "decision log" of autonomous actions for hub review?
-- [ ] What is the maximum acceptable partition duration before the edge agent should halt all operations?
+> All questions resolved in [EDGE-AGENT-SECURITY-SPEC.md](EDGE-AGENT-SECURITY-SPEC.md) Section 4.
+
+- [x] Should reconciliation be automatic or always require human approval? **Decision: Automatic for non-conflicting changes (metadata merges, new discoveries, telemetry). Human approval required for competing mutations and lifecycle desync conflicts. Reconciliation workflow has a 72-hour timeout before conservative auto-resolve (hub wins).**
+- [x] What is the disk spill strategy for P0 events that exceed memory? (Write to local SQLite?) **Decision: Yes, P0 events spill to a dedicated SQLite database (/var/lib/loom/p0-events.db). Max 100,000 disk events. Overflow triggers compaction (oldest 1000 events summarized into a digest), never dropped.**
+- [x] How does the reconciliation protocol interact with Temporal? (New workflow? Signal to existing?) **Decision: New Temporal workflow (ReconciliationWorkflow). Uses Temporal's signal-based human approval pattern for conflict resolution. One workflow per reconnecting agent.**
+- [x] Should the edge agent maintain a local "decision log" of autonomous actions for hub review? **Decision: Yes. SQLite database at /var/lib/loom/decision-log.db. Every autonomous action recorded with full justification, triggering condition, device state, outcome, and policy rule. Hub reviews on reconnect. Retained 90 days after review.**
+- [x] What is the maximum acceptable partition duration before the edge agent should halt all operations? **Decision: No hard halt. Instead, graduated degradation: (1) After 7 days without hub contact, credentials expire and agent enters DEGRADED mode (monitoring only). (2) Clock skew >5 minutes suspends autonomous actions. (3) The agent never fully halts -- passive monitoring (ICMP/ARP) continues indefinitely.**
 
 ---
 
