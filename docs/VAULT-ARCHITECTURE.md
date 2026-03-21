@@ -101,7 +101,40 @@ const (
 
 **TPM 2.0:** The MEK is sealed to the TPM's Storage Root Key (SRK). Unsealing requires the TPM to be in the expected PCR state (measured boot). Go library: `github.com/google/go-tpm/tpm2`.
 
-**Local passphrase (air-gapped fallback only):** The MEK is derived from a passphrase using Argon2id with the following parameters: `time=3, memory=256MB, threads=4, keyLen=32`. The derived key is held in mlock'd memory and never written to disk. The salt is stored alongside the encrypted KEK table. This mode logs a startup warning: `WARN: vault using local passphrase-derived master key — HSM or KMS strongly recommended for production`.
+<!-- AUDIT-FIX: C-01 — Passphrase-derived MEK hardening -->
+
+**Local passphrase (development only — NOT for production):** The MEK is derived from a passphrase using Argon2id with the following parameters: `time=3, memory=256MB, threads=4, keyLen=32`. The derived key is held in mlock'd memory and never written to disk. The salt is stored alongside the encrypted KEK table.
+
+> **WARNING: `local_passphrase` is development-only. Production deployments MUST use HSM, Vault, or Cloud KMS.** The passphrase-derived MEK exists in process memory for the lifetime of the vault process. Any memory dump, core dump, or swap leak exposes the MEK and, transitively, every credential in the system. HSM/KMS providers avoid this entirely because the MEK never enters the LOOM process.
+
+**Startup gate:** The `local_passphrase` provider **refuses to start** unless the environment variable `LOOM_ALLOW_INSECURE_MEK=true` is explicitly set. This prevents accidental production deployments with a passphrase-derived MEK.
+
+**Startup logging:** When `local_passphrase` is active, LOOM logs a **CRITICAL** alert on every startup:
+
+```
+CRITICAL: Vault MEK provider is local_passphrase. The master encryption key exists in process memory.
+          This configuration is for DEVELOPMENT AND TESTING ONLY.
+          Production deployments MUST use HSM (hsm_pkcs11), HashiCorp Vault (hashicorp_vault), or Cloud KMS.
+          Set LOOM_ALLOW_INSECURE_MEK=true to acknowledge this risk (already set).
+```
+
+This message is logged at `slog.LevelError` (not `slog.LevelWarn`) and is emitted to the audit trail as `vault.insecure_mek_startup`.
+
+```go
+// PassphraseMEKConfig configures the local passphrase MEK provider.
+// This provider is for development and testing only.
+type PassphraseMEKConfig struct {
+    Salt              []byte `json:"salt"`
+    Time              uint32 `json:"time"`    // Argon2id time (default: 3)
+    Memory            uint32 `json:"memory"`  // Argon2id memory in KiB (default: 262144 = 256MB)
+    Threads           uint8  `json:"threads"` // Argon2id parallelism (default: 4)
+    NonProductionOnly bool   `json:"non_production_only"` // MUST be true; startup fails if false
+}
+```
+
+`NonProductionOnly` defaults to `true` and **cannot be set to `false`**. It exists as a machine-readable marker so that deployment validation tools, CI/CD gates, and compliance scanners can programmatically reject any configuration that uses `local_passphrase` in a production context.
+
+<!-- END AUDIT-FIX: C-01 -->
 
 ### Key Encryption Key (KEK) — Per Tenant
 
@@ -854,14 +887,19 @@ If a single identity retrieves more than `AlertThreshold` credentials in the win
 
 ### Break Glass Emergency Access
 
-For emergency scenarios where the normal access path is unavailable (e.g., IdP is down, RBAC service is degraded), a break-glass procedure exists:
+<!-- AUDIT-FIX: C-07 — Removed contradictory break-glass design (pre-generated tokens, 1-hour TTL, physical safe storage) -->
+<!-- SUPERSEDED: Previous break-glass design replaced by SECURITY-HARDENING-RESPONSES.md Section 4 -->
 
-1. The operator provides a break-glass token (pre-generated, stored offline in a physical safe or dedicated secrets manager).
-2. The token is a signed JWT with the claim `"break_glass": true` and a short expiry (1 hour).
-3. Break-glass access bypasses RBAC but NOT tenant isolation and NOT audit.
+Break-glass tokens: see **SECURITY-HARDENING-RESPONSES.md Section 4** (authoritative). Summary of the current design:
+
+1. **TTL: 15 minutes.** Tokens expire 15 minutes after generation. This is not configurable.
+2. **Generated on-demand with dual authorization.** Two authorized operators must independently approve the break-glass request. Tokens are **NOT pre-generated** and are **NOT stored offline**.
+3. Break-glass access bypasses RBAC but **NOT** tenant isolation and **NOT** audit.
 4. Every break-glass access produces an enhanced audit record with `action: "credential.break_glass_retrieved"`.
 5. A mandatory notification is sent to all tenant administrators and the security team.
 6. Break-glass tokens are single-use — each token has a unique `jti` that is recorded on first use and rejected on subsequent attempts.
+
+<!-- END AUDIT-FIX: C-07 -->
 
 ---
 
@@ -1194,6 +1232,27 @@ Apple's Data Protection is the gold standard for consumer device credential mana
 6. **Runtime integrity:** On startup, the vault binary verifies its own checksum against a signed manifest (defense against on-disk binary replacement).
 
 **Residual risk:** A sophisticated attacker who compromises the Go compiler itself or the hardware the build runs on. This is mitigated by cross-compilation and verification on multiple independent build environments.
+
+<!-- AUDIT-FIX: C-01 — Additional threat scenario for passphrase-derived MEK -->
+
+### Threat 8: MEK in Process Memory (Passphrase Provider)
+
+**Attack:** An attacker with access to the host (root shell, container escape, or memory forensics on a seized machine) extracts the passphrase-derived MEK from the LOOM vault process memory, gaining the ability to decrypt all KEKs and, transitively, all credentials.
+
+**Defenses (when using HSM/KMS — the production path):**
+1. The MEK **never enters the LOOM process**. All wrap/unwrap operations execute inside the HSM/KMS boundary.
+2. Even with full memory access, the attacker obtains only plaintext of currently-active credentials (bounded by TTL), not the MEK itself.
+
+**Defenses (when using local_passphrase — development only):**
+1. `LOOM_ALLOW_INSECURE_MEK=true` environment variable must be explicitly set — prevents accidental production use.
+2. CRITICAL alert logged on every startup.
+3. `NonProductionOnly: true` in config enables automated compliance rejection.
+4. `mlock`'d memory prevents swap exposure.
+5. Core dumps disabled via `prctl`.
+
+**Residual risk:** **HIGH for local_passphrase.** If the attacker captures process memory at any point during runtime, the MEK is exposed. This risk is **fully mitigated by HSM/KMS providers** where the MEK never enters the process. This is the primary reason `local_passphrase` is development-only.
+
+<!-- END AUDIT-FIX: C-01 -->
 
 ---
 

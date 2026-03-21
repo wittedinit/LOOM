@@ -72,6 +72,19 @@ LOOM exposes metrics in Prometheus exposition format at `/metrics` on the API se
 | `loom_http_response_size_bytes` | Histogram | Response body size |
 | `loom_ratelimit_rejected_total` | Counter | Rate-limited requests by `{tenant_id}` |
 
+#### Security
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `loom_auth_failures_total` | Counter | Authentication failures by `{source, reason, tenant_id}` |
+| `loom_authz_denials_total` | Counter | Authorization denials by `{tenant_id, resource, action}` |
+| `loom_credential_access_total` | Counter | Credential store access by `{tenant_id, credential_ref, actor}` |
+| `loom_tenant_boundary_violations_total` | Counter | Cross-tenant access attempts by `{source_tenant, target_tenant, resource}` |
+| `loom_adapter_anomaly_score` | Gauge | Behavioral anomaly score by `{adapter_name, device_id}` |
+| `loom_break_glass_used_total` | Counter | Break-glass escalations by `{tenant_id, approver_count}` |
+| `loom_certificate_expiry_days` | Gauge | Days until certificate expiry by `{component, serial}` |
+| `loom_lock_contention_total` | Counter | Lock contention events by `{device_id, tenant_id}` |
+
 ---
 
 ## 2. Distributed Tracing
@@ -101,7 +114,7 @@ API Request
 | Temporal → Activity | Temporal's built-in context propagation |
 | Activity → Adapter | Go `context.Context` carries span context |
 | LOOM Hub → Edge Agent | `traceparent` in NATS message headers |
-| LOOM → LLM Provider | `traceparent` in HTTP headers to LLM API |
+| LOOM → LLM Provider | **No propagation.** `traceparent` is stripped from outbound LLM API calls. A new span is created at the LLM boundary carrying only `request_type` and `model` attributes. This prevents leaking internal trace topology to third-party LLM providers. |
 
 ### Span Attributes
 
@@ -188,15 +201,38 @@ jq 'select(.tenant_id == "tenant-a")' /var/log/loom/loom.log
 
 For deployments where tenants must not see each other's log data, LOOM supports per-tenant log routing via slog handlers that split output to tenant-specific log files or streams.
 
-### Sensitive Data Scrubbing
+### Sensitive Data Scrubbing — Allowlist Model
 
-The following fields are **never logged**:
+Log field scrubbing uses an **allowlist**, not a blocklist. Only explicitly permitted fields are emitted. Any field not on the allowlist is logged as `[FIELD:redacted]`. This ensures that new fields added to structs are safe by default — they must be explicitly approved for logging.
+
+**Allowed log fields:**
+
+| Field | Justification |
+|-------|---------------|
+| `time` | Timestamp — no sensitive data |
+| `level` | Log level — no sensitive data |
+| `msg` | Free-text message — reviewed per call site |
+| `correlation_id` | Opaque request ID — no sensitive data |
+| `tenant_id` | Tenant identifier — required for filtering |
+| `device_id` | Device identifier — required for debugging |
+| `adapter` | Adapter name — no sensitive data |
+| `protocol` | Protocol name — no sensitive data |
+| `duration_ms` | Latency — no sensitive data |
+| `status_code` | HTTP status — no sensitive data |
+| `error` | Error message — scrubbed separately to strip credential fragments |
+| `workflow_id` | Temporal workflow ID — required for debugging |
+| `method` | HTTP method — no sensitive data |
+| `path` | Request path — no sensitive data |
+| `component` | Health check component name — no sensitive data |
+
+**Explicitly blocked (never logged regardless of allowlist):**
 - Credential values (passwords, tokens, private keys, SNMP community strings).
 - JWT token bodies (only the `sub` and `tenant_id` claims are logged).
 - Device configuration secrets.
 - LLM prompt content that includes credentials.
+- Request/response bodies.
 
-Scrubbing is enforced at the `slog.Handler` level, not at individual call sites.
+Scrubbing is enforced at the `slog.Handler` level, not at individual call sites. The handler wraps every `slog.Record` and drops or redacts any attribute whose key is not in the allowlist.
 
 ---
 
@@ -286,16 +322,48 @@ Alert rules are defined as Prometheus alerting rules. Each alert maps to a failu
 | `LOOMLLMProviderFallback` | `rate(loom_llm_fallback_total[5m]) > 0` |
 | `LOOMEdgeAgentDisconnected` | Edge agent NATS heartbeat missed for 5m |
 
+#### Security Alerts
+
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| `LOOMAuthFailureSpike` | `rate(loom_auth_failures_total[5m]) > 10` | Critical — possible brute force or credential stuffing |
+| `LOOMAuthzDenialSpike` | `rate(loom_authz_denials_total[5m]) > 5` | Warning — possible privilege escalation attempt |
+| `LOOMTenantBoundaryViolation` | `increase(loom_tenant_boundary_violations_total[1m]) > 0` | Critical — immediate investigation required |
+| `LOOMCredentialAccessAnomaly` | `rate(loom_credential_access_total[5m]) > 3 * avg_over_time(rate(loom_credential_access_total[5m])[1h:])` | Warning — unusual credential access pattern |
+| `LOOMAdapterAnomalyHigh` | `loom_adapter_anomaly_score > 0.8` | Warning — adapter behavioral anomaly detected |
+| `LOOMBreakGlassUsed` | `increase(loom_break_glass_used_total[1m]) > 0` | Critical — break-glass event requires post-incident review |
+| `LOOMCertificateExpiringSoon` | `loom_certificate_expiry_days < 30` | Warning — certificate renewal required |
+| `LOOMCertificateExpiryCritical` | `loom_certificate_expiry_days < 7` | Critical — certificate expires within 7 days |
+| `LOOMLockContentionHigh` | `rate(loom_lock_contention_total[5m]) > 1` | Warning — possible resource contention or DoS |
+
 ---
 
 ## 6. Self-Monitoring
 
 LOOM monitors its own infrastructure components. This is distinct from monitoring managed devices.
 
-### Health Check Endpoint
+### Health Check Endpoints
+
+Health is split into two endpoints to prevent leaking component topology to unauthenticated callers.
+
+**Unauthenticated — for load balancer probes:**
 
 ```
 GET /healthz
+
+Response (200 or 503):
+{
+  "status": "ok"               // "ok" or "degraded" — no component details
+}
+```
+
+This endpoint returns only aggregate status. It does **not** expose component names, versions, or uptime. Load balancers and external monitors use this endpoint.
+
+**Authenticated — for operators (requires valid JWT):**
+
+```
+GET /api/v1/health
+Authorization: Bearer <token>
 
 Response:
 {

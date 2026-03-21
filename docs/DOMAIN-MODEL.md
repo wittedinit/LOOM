@@ -204,6 +204,84 @@ type DeviceOwnership struct {
 
 > **Query pattern:** Repository implementations query shared devices with `WHERE device.tenant_id = ? OR device.id IN (SELECT device_id FROM device_ownership_tenants WHERE tenant_id = ?)`. The `DeviceOwnership` table is only consulted for devices that have `OwnershipID` set — single-tenant devices bypass this entirely.
 
+<!-- AUDIT-FIX: C-06 — Field-level filtering for port_scoped tenants -->
+
+### Field-Level Filtering by Access Level
+
+API responses for shared devices **must** be filtered based on the requesting tenant's `AccessLevel`. Without filtering, a `port_scoped` tenant receives the full `Device` record — including firmware versions, all endpoints, metadata, and credential references — leaking sensitive information beyond their authorized scope.
+
+| Access Level | Visible Fields | Mutations Allowed |
+|-------------|----------------|-------------------|
+| `full` | All fields | All mutations (same as owner) |
+| `read_only` | All fields | None |
+| `port_scoped` | `DeviceID`, `Name`, `DeviceType`, `AllowedEndpoints` only | Operations restricted to `AllowedEndpoints` only |
+
+**What `port_scoped` tenants do NOT see:**
+- `Vendor`, `Model`, `SerialNumber` — hardware identity (information leakage risk)
+- `FirmwareVersion` — reveals patch status (vulnerability intelligence)
+- `Metadata` — may contain rack location, asset tags, internal notes
+- Full `Endpoints` list — only their `AllowedEndpoints` are visible
+- `CredentialRefID` on any endpoint — credential references are never exposed
+- `Status` beyond their scoped endpoints — no visibility into overall device health
+
+### Go Types
+
+```go
+// DeviceView is a filtered projection of a Device, tailored to the
+// requesting tenant's access level. This is what the API returns —
+// never the raw Device struct for shared devices.
+type DeviceView struct {
+    DeviceID         uuid.UUID      `json:"device_id"`
+    Name             string         `json:"name"`
+    DeviceType       DeviceType     `json:"device_type"`
+    // The following fields are nil/empty for port_scoped access.
+    Vendor           *string        `json:"vendor,omitempty"`
+    Model            *string        `json:"model,omitempty"`
+    SerialNumber     *string        `json:"serial_number,omitempty"`
+    FirmwareVersion  *string        `json:"firmware_version,omitempty"`
+    Status           *DeviceStatus  `json:"status,omitempty"`
+    Metadata         map[string]string `json:"metadata,omitempty"`
+    Endpoints        []Endpoint     `json:"endpoints,omitempty"` // filtered to AllowedEndpoints for port_scoped
+}
+
+// FilterForAccess produces a DeviceView from a full Device record,
+// filtered according to the tenant's access level.
+// This function MUST be called at the API layer before any Device
+// is serialized into a response for a shared-device query.
+func FilterForAccess(device Device, access TenantAccess) DeviceView {
+    view := DeviceView{
+        DeviceID:   device.ID,
+        Name:       device.Name,
+        DeviceType: device.Type,
+    }
+    switch access.AccessLevel {
+    case AccessLevelFull, AccessLevelReadOnly:
+        view.Vendor = &device.Vendor
+        view.Model = &device.Model
+        view.SerialNumber = &device.SerialNumber
+        view.FirmwareVersion = &device.FirmwareVersion
+        view.Status = &device.Status
+        view.Metadata = device.Metadata
+        // All endpoints visible (credentials refs still stripped for read_only)
+    case AccessLevelPortScoped:
+        // Only DeviceID, Name, DeviceType, and AllowedEndpoints.
+        // All other fields remain nil/empty.
+        // Endpoints filtered to AllowedEndpoints only.
+    }
+    return view
+}
+```
+
+### Enforcement Points
+
+Field-level filtering is enforced at three layers:
+
+1. **API layer (response filtering):** `FilterForAccess()` is called before serializing any `Device` in an API response for shared-device queries. This is the primary enforcement point.
+2. **Workflow dispatch (scope check):** When a workflow targets a shared device, the workflow planner verifies the requesting tenant's `AccessLevel` and restricts the workflow to operations within their authorized scope. A `port_scoped` tenant cannot submit a workflow that operates on endpoints outside their `AllowedEndpoints`.
+3. **Adapter execution (endpoint restriction):** The adapter layer validates that the target endpoint is within the tenant's `AllowedEndpoints` before executing any operation. This is a defense-in-depth check — even if the API and workflow layers are bypassed, the adapter refuses to operate on unauthorized endpoints.
+
+<!-- END AUDIT-FIX: C-06 -->
+
 ---
 
 ## Endpoint
