@@ -12,14 +12,37 @@
 
 Credentials cached on edge agents are stored as **AES-256-GCM encrypted columns in the agent's local SQLite database**. Each credential value is encrypted with a per-credential Data Encryption Key (DEK), and each DEK is wrapped by the agent's Key Encryption Key (KEK).
 
-### Key Derivation
+### Key Derivation and Credential Caching Mode
 
-The KEK source depends on hardware capability:
+<!-- AUDIT-FIX: C-02 — TPM is MANDATORY for credential caching; non-TPM agents use fetch-on-demand -->
 
-- **Preferred (TPM available):** KEK is sealed to the device's TPM 2.0 module. The sealed key can only be unsealed on the specific physical device, binding credentials to hardware identity.
-- **Mandatory minimum (no TPM):** KEK is derived from the agent enrollment secret using **Argon2id** (time=3, memory=64 MiB, parallelism=4, keyLen=32). This is the minimum viable encryption and is required on every agent regardless of TPM availability.
+The agent's credential handling mode depends on hardware capability:
 
-TPM binding is preferred when available but is not a hard requirement. All agents must implement Argon2id-derived encryption at minimum.
+- **TPM available (`CachedWithTPM` mode):** KEK is sealed to the device's TPM 2.0 module. The sealed key can only be unsealed on the specific physical device, binding credentials to hardware identity. **Only agents with TPM may cache credentials locally.** This is no longer optional — TPM is MANDATORY for any agent that caches credentials.
+- **No TPM (`FetchOnDemand` mode):** Agents without TPM **do not cache credentials locally**. Instead, they retrieve credentials from the hub for each operation and discard them from memory immediately after use. Credentials are never written to the local SQLite database.
+
+> **Design decision (revised):** The previous design allowed non-TPM agents to cache credentials using Argon2id-derived encryption. This was identified as a single point of compromise: if the enrollment secret is leaked, all cached credentials on every non-TPM agent are recoverable. The enrollment secret is a shared secret distributed at provisioning time and is not bound to hardware identity.
+>
+> **New rule:** TPM is MANDATORY for credential caching. Non-TPM agents operate in fetch-on-demand mode.
+
+**Tradeoff:** Fetch-on-demand mode has higher latency per operation (one round-trip to hub per credential retrieval) and requires hub connectivity for any operation that needs credentials. Non-TPM agents **cannot perform credentialed operations while offline**. This is an acceptable tradeoff because the alternative (caching with a software-derived key) provides insufficient protection against enrollment secret compromise.
+
+```go
+// EdgeCredentialMode determines how the agent handles credentials.
+type EdgeCredentialMode string
+
+const (
+    // CachedWithTPM — credentials are cached locally in encrypted SQLite,
+    // with KEK sealed to TPM 2.0. Requires TPM hardware.
+    CachedWithTPM EdgeCredentialMode = "cached_with_tpm"
+
+    // FetchOnDemand — credentials are retrieved from the hub for each
+    // operation. Never cached locally. Used when TPM is not available.
+    FetchOnDemand EdgeCredentialMode = "fetch_on_demand"
+)
+```
+
+<!-- END AUDIT-FIX: C-02 -->
 
 ### Go Types
 
