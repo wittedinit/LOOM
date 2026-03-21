@@ -395,25 +395,112 @@ The orchestrator uses compensation info to build rollback plans when multi-step 
 
 ## Which Adapters Implement Which Families
 
-| Adapter | Connector | Discoverer | Executor | StateReader | Watcher |
-|---------|-----------|------------|----------|-------------|---------|
-| SSH | Yes | Yes | Yes (commands) | No | No |
-| Redfish | Yes | Yes | Yes (power, boot) | Yes | No |
-| SNMP | Yes | Yes | No (read-only) | Yes | No |
-| IPMI | Yes | No | Yes (power, boot) | Yes (sensors) | No |
-| NETCONF | Yes | Yes | Yes (config) | Yes | No |
-| gNMI | Yes | Yes | Yes (config) | Yes | Yes (telemetry) |
-| eAPI | Yes | Yes | Yes (config) | Yes | No |
-| NX-API | Yes | Yes | Yes (config) | Yes | No |
-| AMT | Yes | No | Yes (power, boot, KVM) | Yes | No |
-| PiKVM | Yes | No | Yes (power, HID) | Yes (screenshot) | No |
-| vSphere | Yes | Yes | Yes (VM lifecycle) | Yes | Yes (events) |
-| Proxmox | Yes | Yes | Yes (VM/CT lifecycle) | Yes | No |
-| libvirt | Yes | Yes | Yes (domain lifecycle) | Yes | Yes (events) |
+| Adapter | Connector | Discoverer | Executor | StateReader | Watcher | Compensation Reliability | SnapshotCapable |
+|---------|-----------|------------|----------|-------------|---------|--------------------------|-----------------|
+| SSH | Yes | Yes | Yes (commands) | No | No | none (raw commands) / snapshot_restore (config backup) | Yes (config dump) |
+| Redfish | Yes | Yes | Yes (power, boot) | Yes | No | best_effort | No |
+| SNMP | Yes | Yes | No (read-only) | Yes | No | n/a (read-only) | No |
+| IPMI | Yes | No | Yes (power, boot) | Yes (sensors) | No | best_effort | No |
+| NETCONF | Yes | Yes | Yes (config) | Yes | No | transactional (candidate commit) | Yes |
+| gNMI | Yes | Yes | Yes (config) | Yes | Yes (telemetry) | transactional (OpenConfig) | Yes |
+| eAPI | Yes | Yes | Yes (config) | Yes | No | best_effort | Yes (show running) |
+| NX-API | Yes | Yes | Yes (config) | Yes | No | best_effort | Yes (show running) |
+| AMT | Yes | No | Yes (power, boot, KVM) | Yes | No | best_effort | No |
+| PiKVM | Yes | No | Yes (power, HID) | Yes (screenshot) | No | none | No |
+| vSphere | Yes | Yes | Yes (VM lifecycle) | Yes | Yes (events) | transactional (snapshots) | Yes |
+| Proxmox | Yes | Yes | Yes (VM/CT lifecycle) | Yes | No | transactional (snapshots) | Yes |
+| libvirt | Yes | Yes | Yes (domain lifecycle) | Yes | Yes (events) | transactional (snapshots) | Yes |
 
 **Key observations:**
 - Every adapter implements `Connector` — no exceptions.
-- SNMP is read-only: it implements `Discoverer` and `StateReader` but not `Executor`.
+- SNMP is read-only: it implements `Discoverer` and `StateReader` but not `Executor`. Compensation reliability is not applicable.
 - Only gNMI, vSphere, and libvirt implement `Watcher` — they have native streaming support.
 - IPMI and AMT skip `Discoverer` — they are control-plane protocols, not inventory sources.
 - PiKVM is a special case: it provides HID injection and screenshot capture, not traditional network management.
+- NETCONF and gNMI have `transactional` compensation — they support candidate configs and confirmed commits.
+- SSH compensation depends on the device: if the device supports `show running-config` or equivalent, the SSH adapter can take a config snapshot. Otherwise, compensation is `none`.
+- vSphere, Proxmox, and libvirt have `transactional` compensation via VM/container snapshots.
+- Adapters with `best_effort` compensation (Redfish, IPMI, eAPI, NX-API, AMT) can attempt reverse operations but cannot guarantee exact pre-op state restoration.
+
+---
+
+## Config Translation Strategy
+
+> Addresses ADVERSARIAL-REVIEW.md Finding 2.2 and 4.3: Multi-vendor config translation is a research problem, not an engineering task. LOOM uses vendor-native templates, not universal translation.
+
+### Approach: Intent + Vendor-Native Templates
+
+LOOM does NOT attempt live cross-vendor config translation (e.g., Cisco ACL to Junos firewall filter to Arista ACL). That is an unsolved research problem. Instead:
+
+1. **LOOM stores intent in a canonical format.** Intent describes WHAT should happen, not HOW.
+2. **Each adapter has vendor-specific templates** that render the intent into native device syntax.
+3. **Templates are validated, tested, cached, and version-controlled.** They are not generated at runtime by the LLM.
+
+```go
+// ConfigIntent is a vendor-neutral description of a desired configuration change.
+// It describes WHAT, not HOW. Each adapter's template engine renders it into
+// native syntax for the target device.
+type ConfigIntent struct {
+    IntentType  string         `json:"intent_type"`  // "acl_rule", "vlan_create", "interface_config", "static_route"
+    Parameters  map[string]any `json:"parameters"`   // intent-specific typed parameters
+    Description string         `json:"description"`  // human-readable: "block TCP 80 from 10.0.0.0/8"
+    Priority    int            `json:"priority"`     // ordering hint for order-dependent configs (ACLs)
+}
+
+// VendorTemplate renders a ConfigIntent into vendor-native syntax.
+type VendorTemplate struct {
+    ID           string    `json:"id"`            // "cisco_ios_acl_deny", "junos_firewall_filter_term"
+    IntentType   string    `json:"intent_type"`   // which ConfigIntent.IntentType this handles
+    Vendor       string    `json:"vendor"`        // "cisco_ios", "junos", "arista_eos", "sonic"
+    TemplateBody string    `json:"template_body"` // Go template or Jinja2 template
+    Version      string    `json:"version"`       // semver for the template
+    Validated    bool      `json:"validated"`      // has this template been tested against a real device?
+    ValidatedAt  time.Time `json:"validated_at"`
+    Checksum     string    `json:"checksum"`       // SHA-256 of TemplateBody
+}
+
+// TemplateRegistry stores and retrieves vendor templates.
+type TemplateRegistry interface {
+    // Lookup finds the best template for a given intent type and vendor.
+    Lookup(intentType string, vendor string) (*VendorTemplate, error)
+
+    // Register adds or updates a template. Requires validation before production use.
+    Register(template VendorTemplate) error
+
+    // ListByVendor returns all templates for a vendor, grouped by intent type.
+    ListByVendor(vendor string) ([]VendorTemplate, error)
+}
+```
+
+### LLM Role in Template Generation
+
+The LLM can assist with **generating new templates**, but templates are never used in production without validation:
+
+1. Operator requests a new intent type for a vendor (e.g., "QoS policy for Arista EOS").
+2. LLM generates a candidate template based on vendor documentation (RAG-assisted).
+3. Template is syntax-checked against the vendor's config grammar (where available).
+4. Template is tested against a lab device or config simulator.
+5. Template is committed to the template registry with `Validated: true`.
+6. Only validated templates are used in production workflows.
+
+### MVP Path: Raw Config Push
+
+For MVP (Phases 0-5), the primary config path is **raw config push**: the operator provides vendor-native config, and LOOM pushes it to the device via the appropriate adapter. No translation, no templates.
+
+```go
+// RawConfigPush is the MVP escape hatch. The operator provides vendor-native
+// config and LOOM pushes it without translation.
+type RawConfigPush struct {
+    DeviceID     string `json:"device_id"`
+    ConfigFormat string `json:"config_format"` // "cli_commands", "xml", "json", "set_commands"
+    ConfigBody   string `json:"config_body"`   // the actual vendor-native config
+    DryRun       bool   `json:"dry_run"`       // if true, validate but do not apply
+}
+```
+
+### What Is NOT Supported
+
+- No live Cisco-to-Junos config translation.
+- No universal ACL model that covers stateful firewalls, object groups, NAT, QoS, or time-based rules. The `SetACLOp` in OPERATION-TYPES.md covers basic permit/deny only. Complex policies use `RawConfigPush`.
+- No universal routing protocol model. BGP, OSPF, and IS-IS have vendor-specific knobs that matter in production. Use `RawConfigPush` for these.
+- Template library grows over time via validated, tested, version-controlled contributions. Coverage is explicitly tracked per vendor per intent type.
