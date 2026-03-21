@@ -191,7 +191,47 @@ Scoring rules:
 
 ---
 
-## 9. Discovery Service Identity Flow
+## 9. Identity Matcher Concurrency (H2)
+
+Concurrent discovery from multiple sources (e.g., SSH and Redfish scanning the same subnet simultaneously) can create duplicate device records if two goroutines both conclude "no match found" and each creates a new device. This section defines the two-phase matching protocol that produces deterministic results under concurrency.
+
+### Two-Phase Matching
+
+**Phase 1 — Read-Only Scoring (fast path, no locks)**
+
+1. Discovery result arrives with a set of `ExternalIdentity` values.
+2. Query existing devices for matching attributes (tenant-scoped, using the priority order from Section 2).
+3. Compute `CalculateMatchConfidence` for each candidate.
+4. If a unique match is found with confidence > 0.7: proceed to Phase 2 merge.
+5. If no match is found: proceed to Phase 2 create.
+6. If ambiguous (multiple candidates): queue for background reconciliation.
+
+Phase 1 performs no writes. It is safe to run concurrently without locks.
+
+**Phase 2 — Lock + Merge/Create (serialized per identity)**
+
+1. Acquire PostgreSQL advisory locks on normalized identity values:
+   ```sql
+   SELECT pg_advisory_xact_lock(hashtext(identity_value))
+   FROM unnest(ARRAY['serial:ABC123', 'mac:00:11:22:33:44:55']) AS identity_value;
+   ```
+2. Re-run the match query under `SELECT ... FOR UPDATE` on candidate device rows.
+3. If the match result is unchanged from Phase 1: execute merge or create.
+4. If the match result changed (another goroutine merged first): re-evaluate and enrich instead of creating a duplicate.
+5. Commit the transaction. Advisory locks are released automatically.
+
+This ensures that concurrent discovery of the same physical device from multiple sources produces exactly one device record, regardless of timing.
+
+### Guarantees
+
+- **No duplicate devices from concurrent discovery.** Advisory locks on identity values serialize the create-or-merge decision.
+- **No global lock.** Locking is scoped to specific identity values, so discoveries of unrelated devices proceed in parallel.
+- **Deterministic results.** The same set of discovery results, regardless of arrival order, produces the same final device state.
+- **Tenant isolation preserved.** Advisory locks include the tenant scope — the same serial number in two different tenants produces two separate devices, never merged.
+
+---
+
+## 10. Discovery Service Identity Flow
 
 Step-by-step flow for every discovery result:
 
@@ -236,7 +276,7 @@ Step-by-step flow for every discovery result:
 
 ---
 
-## 10. Example Scenarios
+## 11. Example Scenarios
 
 ### Scenario 1: Same Server Discovered via SSH and Redfish
 
