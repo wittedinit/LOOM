@@ -498,6 +498,86 @@ type RawConfigPush struct {
 }
 ```
 
+<!-- AUDIT-FIX: C-04 — Mandatory policy engine for RawConfigPush -->
+
+### RawConfigPush Policy Engine (Mandatory)
+
+`RawConfigPush` is a powerful escape hatch that sends arbitrary vendor-native commands to devices. Without constraints, it is equivalent to an unrestricted shell. The following policy engine is **mandatory** and **cannot be bypassed**.
+
+#### Command Blocklist
+
+The following commands (and their vendor-specific equivalents) are **blocked unconditionally**. The policy engine rejects any `ConfigBody` containing these patterns before the config reaches the adapter:
+
+| Blocked Pattern | Reason |
+|----------------|--------|
+| `shutdown` (interface/system context) | Prevents accidental link/device shutdown |
+| `no ip routing` | Disables routing — catastrophic for network devices |
+| `erase` | Erases configuration or filesystem |
+| `reload` / `reboot` | Uncontrolled device restart |
+| `format` | Filesystem format |
+| `write erase` / `erase startup-config` | Wipes startup configuration |
+| `delete` (filesystem context) | File deletion |
+| `crypto key zeroize` | Destroys cryptographic keys |
+
+#### Content Scanning
+
+Beyond the blocklist, the policy engine scans `ConfigBody` with regex patterns to detect:
+
+- **New user account creation** (`username`, `user add`, `aaa authentication`)
+- **AAA modifications** (`aaa`, `tacacs`, `radius`, `ldap` configuration changes)
+- **Logging disablement** (`no logging`, `logging disable`, `no syslog`)
+- **SNMP community changes** (`snmp-server community`)
+- **Routing table manipulation** (`ip route`, `router bgp`, `router ospf` — blocked in RawConfigPush; use typed operations instead)
+
+Content scanning matches are flagged for mandatory human review (they are not auto-blocked, because legitimate use cases exist, but they cannot proceed without explicit approval).
+
+#### Human Approval Required — No Exceptions
+
+**ALL `RawConfigPush` operations require human approval.** There is no auto-execute tier, no "trusted operator" bypass, no CI/CD exception. This is hardcoded, not configurable.
+
+The approval flow:
+1. Operator submits `RawConfigPush` request.
+2. Policy engine validates against blocklist (blocked patterns are rejected immediately).
+3. Content scanning flags any suspicious patterns.
+4. A **different** authorized operator must approve the request via the approval gate (Temporal signal).
+5. Pre-push config snapshot is taken (mandatory — see below).
+6. Config is pushed to the device.
+7. Post-push diff is computed and stored in the audit trail.
+
+#### Pre-Push Snapshot and Post-Push Diff
+
+- **Pre-push snapshot:** Before any `RawConfigPush` execution, the adapter **must** capture the device's current running configuration via `TakeSnapshot()`. If the adapter does not implement `SnapshotCapable`, the `RawConfigPush` is rejected with a `PermanentError`. There is no exception — you cannot push raw config without a rollback point.
+- **Post-push diff:** After successful execution, the adapter reads the new running configuration and computes a diff against the pre-push snapshot. The diff is stored in the audit trail alongside the original `ConfigBody`, the approver identity, and the correlation ID.
+
+#### Go Types
+
+```go
+// RawConfigPolicy enforces constraints on RawConfigPush operations.
+// RequiresApproval is hardcoded to true and is not configurable.
+type RawConfigPolicy struct {
+    BlockedPatterns   []regexp.Regexp // Patterns that cause immediate rejection
+    ScanPatterns      []regexp.Regexp // Patterns that flag for mandatory review
+    RequiresApproval  bool            // Always true. Not configurable. Hardcoded.
+    RequiresSnapshot  bool            // Always true. Not configurable. Hardcoded.
+    RequiresPostDiff  bool            // Always true. Not configurable. Hardcoded.
+}
+
+// NewRawConfigPolicy returns the default policy. The three boolean fields
+// are hardcoded to true and have no setter — this is intentional.
+// Compile-time enforcement: the fields are unexported in production code
+// and set only by the constructor.
+func NewRawConfigPolicy() RawConfigPolicy {
+    return RawConfigPolicy{
+        RequiresApproval: true,
+        RequiresSnapshot: true,
+        RequiresPostDiff: true,
+        // BlockedPatterns and ScanPatterns are loaded from embedded config
+    }
+}
+```
+
+<!-- END AUDIT-FIX: C-04 -->
+
 ### What Is NOT Supported
 
 - No live Cisco-to-Junos config translation.

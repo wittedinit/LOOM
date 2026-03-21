@@ -553,6 +553,69 @@ The LLM engine is provider-agnostic and uses a tiered approach: cloud APIs (Clau
 
 ---
 
+<!-- AUDIT-FIX: C-05 — Coordinated pool exhaustion attack -->
+
+## 9.5 Coordinated Pool Exhaustion Attack
+
+- **Failure**: An attacker (or a buggy integration) exhausts database and/or adapter connection pools by opening many slow or idle connections. This prevents legitimate operations — including security-critical ones like credential rotation and approval processing — from acquiring connections. Temporal's retry mechanism amplifies the damage: failed activities retry, each retry attempt tries to acquire a connection from the exhausted pool, generating more load.
+- **Detection**: Pool metrics show `pool_waiting` at capacity. `pool_acquire_duration` exceeds 5s. Security-critical operations (credential rotation, approval processing) fail with connection timeouts. LOOM emits `loom._system.pool.exhaustion_attack_suspected` when the reserved critical pool drops below 50% utilization while the normal pool is at 100%.
+- **Impact**: If all operations share a single pool, an attacker can block credential rotations (leaving expired credentials in use), delay approval processing (causing approval timeouts), and prevent security alerts from being persisted to the audit trail.
+- **Behavior**: LOOM uses **priority-based connection allocation** with separate pools to prevent this attack:
+
+### Priority-Based Connection Allocation
+
+| Priority | Pool | Reserved Capacity | Use Case |
+|----------|------|-------------------|----------|
+| `Critical` | Reserved pool | 20% of total connections | Credential rotation, approval processing, audit writes, break-glass |
+| `Normal` | Standard pool | 70% of total connections | API requests, workflow activities, discovery |
+| `BestEffort` | Overflow pool | 10% of total connections | Telemetry writes, cache warming, background reconciliation |
+
+**Separate pools for API requests and Temporal workers:** API-facing database connections and Temporal worker database connections use **independent pools**. An API-layer DoS cannot starve Temporal workers, and runaway Temporal activities cannot block API responses.
+
+**Connection timeout for API requests:** API requests that cannot acquire a pool connection within **5 seconds** fail fast with `503 Service Unavailable` and `Retry-After: 1`. They do not hold the request open waiting for a connection — this prevents thread/goroutine exhaustion on the API server.
+
+### Go Types
+
+```go
+// PoolPriority classifies the priority of a connection request.
+type PoolPriority string
+
+const (
+    // Critical — security-critical operations. Reserved pool slots guaranteed.
+    Critical   PoolPriority = "critical"
+    // Normal — standard API and workflow operations.
+    Normal     PoolPriority = "normal"
+    // BestEffort — background tasks that can be deferred or dropped.
+    BestEffort PoolPriority = "best_effort"
+)
+
+// PriorityPool manages connection pools with priority-based allocation.
+// Critical operations always have reserved capacity, even when the
+// overall pool is exhausted.
+type PriorityPool struct {
+    CriticalPool   *pgxpool.Pool // 20% of total connections, reserved
+    NormalPool     *pgxpool.Pool // 70% of total connections
+    BestEffortPool *pgxpool.Pool // 10% of total connections
+    APITimeout     time.Duration // 5s — fail fast for API requests
+}
+
+// Acquire returns a connection from the appropriate pool based on priority.
+// Critical requests are served from the reserved pool and are never blocked
+// by normal or best-effort traffic. Returns error if the priority pool
+// is itself exhausted (which indicates a genuine overload, not an attack).
+func (pp *PriorityPool) Acquire(ctx context.Context, priority PoolPriority) (*pgxpool.Conn, error) {
+    panic("not implemented")
+}
+```
+
+- **Recovery**: Identify the source of pool exhaustion. Check `pg_stat_activity` for idle-in-transaction connections. Kill long-running queries. If the attack is external, rate-limit or block the source IP/tenant. The priority pool ensures security-critical operations continue functioning during the attack.
+- **Data Loss Risk**: None. Operations either succeed or fail cleanly.
+- **RTO**: Immediate for critical operations (reserved pool). Minutes to identify and block the exhaustion source.
+
+<!-- END AUDIT-FIX: C-05 -->
+
+---
+
 ## 10. Design Principles: LOOM's Failure Philosophy
 
 These principles are not aspirational -- they are design constraints enforced in code review, architecture review, and testing.
@@ -633,6 +696,7 @@ Escalation is via the configured notification channels (webhook, email, PagerDut
 | LLM all providers down | Yes (deterministic fallback) | Restore LLM | Seconds |
 | LLM hallucination | Yes (validation pipeline) | None | Seconds |
 | Edge partition | Yes (autonomous mode) | Review edge actions on reconnect | Automatic |
+| Pool exhaustion attack | Yes (priority pools) | Identify/block source | Immediate (critical ops) |
 | Thundering herd | Yes (circuit breaker) | Investigate root cause | Depends |
 | Disk full | No | Free space | Minutes-hours |
 | OOM kill | Yes (auto-restart) | Investigate leak, increase limits | < 1 min |
