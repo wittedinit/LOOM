@@ -4,6 +4,76 @@
 
 LOOM doesn't replace Kubernetes, Terraform, Ansible, or any tool that already does its job well. It **orchestrates them**. LOOM is the meta-orchestration layer that weaves together existing tools, infrastructure, and workflows — public cloud, private cloud, bare metal, network devices, edge nodes — into a single, intelligent control plane. It coordinates orchestrators, fills the gaps between them, and makes decisions no individual tool can make because no individual tool has the full picture.
 
+---
+
+## Start Here
+
+| Goal | Documents |
+|------|-----------|
+| **Understand the Problem** | [Competitive Analysis](docs/COMPETITIVE-ANALYSIS.md) -- [Research](research/) |
+| **Understand the Solution** | [Architecture](docs/ARCHITECTURE.md) -- [Tech Stack](docs/TECH-STACK.md) -- [Request-to-Device Flow](docs/REQUEST-TO-DEVICE-FLOW.md) |
+| **Understand the Contracts** | [Domain Model](docs/DOMAIN-MODEL.md) -- [Adapter Contract](docs/ADAPTER-CONTRACT.md) -- [Workflow Contract](docs/WORKFLOW-CONTRACT.md) |
+| **Understand the Security** | [Security Model](docs/SECURITY-MODEL.md) -- [Vault Architecture](docs/VAULT-ARCHITECTURE.md) -- [Attack Surfaces](docs/security/) |
+| **Understand the Plan** | [Implementation Plan](docs/IMPLEMENTATION-PLAN.md) -- [Deployment Topology](docs/DEPLOYMENT-TOPOLOGY.md) |
+
+---
+
+## Tech Stack
+
+| Component | Choice | Why |
+|-----------|--------|-----|
+| Language | **Go** | Protocol libraries, goroutines, single binary deploys |
+| Workflow Engine | **Temporal** | Durable execution, saga pattern, signals, visibility |
+| Event Bus | **NATS JetStream** | 14MB binary, edge leaf nodes, 150K msgs/sec |
+| Database | **PostgreSQL + TimescaleDB + pgvector** | Multi-model (relational + time-series + vector) in one system |
+| UI | **React + Next.js + shadcn/ui** | Largest ecosystem, topology visualization support |
+| LLM | **Claude API + local vLLM** | Provider-agnostic, air-gapped capable |
+
+Full rationale: [Tech Stack Decision](docs/TECH-STACK.md) | Research: [Language](research/tech-stack/01-core-language.md), [Data Store](research/tech-stack/02-data-store.md), [LLM](research/tech-stack/03-llm-integration.md), [Workflow](research/tech-stack/04-workflow-engine.md), [UI](research/tech-stack/05-ui-dashboard.md)
+
+---
+
+## Security Posture
+
+**71 attack vectors** tested across **8 attack surfaces** with working exploit and defense code for each:
+
+| Surface | Vectors | Surface | Vectors |
+|---------|---------|---------|---------|
+| [Protocol Adapters](docs/security/ATTACK-SURFACE-ADAPTERS.md) | 10 | [NATS JetStream](docs/security/ATTACK-SURFACE-NATS.md) | 8 |
+| [REST API](docs/security/ATTACK-SURFACE-API.md) | 10 | [PostgreSQL](docs/security/ATTACK-SURFACE-POSTGRESQL.md) | 7 |
+| [LLM Integration](docs/security/ATTACK-SURFACE-LLM.md) | 8 | [Temporal](docs/security/ATTACK-SURFACE-TEMPORAL.md) | 8 |
+| [Credential Vault](docs/security/ATTACK-SURFACE-VAULT.md) | 10 | [UI & Supply Chain](docs/security/ATTACK-SURFACE-UI-SUPPLY-CHAIN.md) | 10 |
+
+The [credential vault](docs/VAULT-ARCHITECTURE.md) implements enterprise-grade encryption comparable to Apple's Data Protection architecture:
+- **AES-256-GCM** with AES-NI hardware acceleration on all modern x86-64 processors
+- **Envelope encryption**: per-credential DEKs wrapped in per-tenant KEKs wrapped in a master key
+- **Zero plaintext credentials** — ever — in database, filesystem, swap, logs, error messages, or serialization output
+- Memory-locked pages, constant-time wipes, core dump protection
+
+Full model: [Security Model](docs/SECURITY-MODEL.md) | [Vault Architecture](docs/VAULT-ARCHITECTURE.md)
+
+---
+
+## Project Status
+
+**Phase:** 0 — Contracts (Freeze All Seams Before Code)
+
+**Completed:**
+- Competitive landscape research across 10 domains and 100+ tools
+- Architecture design and system decomposition
+- Tech stack selection with ADR-backed decisions
+- All 22 contract and specification documents
+- 11 Architecture Decision Records
+- Security analysis: 71 attack vectors across 8 surfaces
+- Vault architecture with hardware-accelerated encryption design
+- 12-phase implementation plan (v3, AI-reviewed)
+
+**Next:** Phase 1 — Skeleton (binary boots, Temporal connects, NATS connects, single table migrates)
+
+Full plan: [Implementation Plan](docs/IMPLEMENTATION-PLAN.md)
+
+---
+
 ## Vision
 
 - **Universal Reach** — Orchestrate anything: VMs, containers, bare metal, switches, routers, serverless functions, SaaS APIs, and custom binaries. No infrastructure is out of scope.
@@ -13,7 +83,7 @@ LOOM doesn't replace Kubernetes, Terraform, Ansible, or any tool that already do
 - **Single Pane of Glass** — Unified view into health, cost, and performance across your entire estate — from cloud regions to rack-level hardware.
 - **Workflow Orchestration** — Not just infrastructure — orchestrate application-level workflows, CI/CD pipelines, data flows, and multi-step processes end to end.
 
-## Architecture (Planned)
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -54,14 +124,7 @@ LOOM doesn't replace Kubernetes, Terraform, Ansible, or any tool that already do
 | **Lifecycle** | Manual teardown, forgotten resources | Automated teardown with budget, TTL, and idle triggers |
 | **Multi-Tenancy** | Namespace-level at best | First-class tenant model with network segmentation and firewall orchestration |
 
-## Documentation
-
-- **[Implementation Plan](docs/IMPLEMENTATION-PLAN.md)** — 12-phase roadmap from contracts to production (v3, AI-reviewed)
-- **[Architecture](docs/ARCHITECTURE.md)** — System design, adapter layer, LLM decision engine
-- **[Tech Stack](docs/TECH-STACK.md)** — Language, database, LLM, workflow engine, and UI decisions with rationale
-- **[Competitive Analysis](docs/COMPETITIVE-ANALYSIS.md)** — 100+ tools analyzed across 10 domains
-- **[Request-to-Device Flow](docs/REQUEST-TO-DEVICE-FLOW.md)** — End-to-end orchestration from intent to verified delivery
-- **[Research](research/)** — Comprehensive landscape research across all orchestration domains
+---
 
 ## Why LOOM Exists: The Problem
 
@@ -146,26 +209,78 @@ Observability tools (Datadog, Grafana, Dynatrace, Splunk) — **11 out of 13 hav
 
 ---
 
-## Research Coverage
+## Documentation Index
 
-10 parallel research agents analyzed **100+ tools** across the entire orchestration landscape:
+### Foundation
+| Document | Description |
+|----------|-------------|
+| [Competitive Analysis](docs/COMPETITIVE-ANALYSIS.md) | 100+ tools analyzed across 10 domains — the gap analysis that justifies LOOM |
+| [Architecture](docs/ARCHITECTURE.md) | System design, adapter layer, LLM decision engine, component decomposition |
+| [Tech Stack](docs/TECH-STACK.md) | Language, database, LLM, workflow engine, and UI decisions with full rationale |
+| [Deployment Topology](docs/DEPLOYMENT-TOPOLOGY.md) | Single-laptop to globally distributed fleet — 4 deployment modes with resource sizing |
 
-| Domain | Tools Analyzed |
-|--------|---------------|
-| Cloud-Native Orchestrators | Kubernetes, Nomad, OpenShift, Rancher, Tanzu, Docker Swarm, Mesos |
-| IaC & Provisioning | Terraform, Pulumi, Crossplane, Ansible, CloudFormation, SaltStack |
-| Workflow Orchestrators | Airflow, Temporal, Prefect, Argo, Dagster, Step Functions, NiFi |
-| Network & Bare Metal | Cisco NSO, MAAS, Tinkerbell, Ironic, NetBox, Apstra, CloudVision |
-| Meta-Orchestrators | Backstage, Kratix, Humanitec, Port, Upbound, Spacelift |
-| AI/LLM-Driven Ops | Kubiya, Sedai, Cast.ai, Harness, Dynatrace Davis, Karpenter |
-| FinOps & Cost | CloudHealth, Kubecost, Infracost, Vantage, OpenCost, Spot.io |
-| Observability | Datadog, Grafana, New Relic, Splunk, Dynatrace, Zabbix |
-| Remote Management | IPMI, Redfish, Intel AMT, PiKVM, iDRAC, iLO, SNMP, NETCONF, gNMI |
-| Network OS & Switches | SONiC, Cumulus, Cisco IOS/NX-OS/ACI, Junos, EOS, MikroTik, VyOS |
+### Contracts & Models
+| Document | Description |
+|----------|-------------|
+| [Domain Model](docs/DOMAIN-MODEL.md) | Canonical resource types: Target, Device, Endpoint, Capability, StateSnapshot |
+| [Adapter Contract](docs/ADAPTER-CONTRACT.md) | Operation-family interfaces: Connector, Discoverer, Executor, StateReader, Watcher |
+| [Workflow Contract](docs/WORKFLOW-CONTRACT.md) | Temporal integration rules: one step = one business action, one activity = one side effect |
+| [Discovery Contract](docs/DISCOVERY-CONTRACT.md) | Device discovery behavioral contract: probe, identify, classify, enrich |
+| [Operation Types](docs/OPERATION-TYPES.md) | Typed operation structs — no `map[string]any` — compile-time correctness |
+| [Identity Model](docs/IDENTITY-MODEL.md) | The most dangerous seam: DeviceID stability, merge/split rules, confidence scoring |
+| [Event Model](docs/EVENT-MODEL.md) | NATS JetStream subject hierarchy, envelope format, stream configuration |
+| [Error Model](docs/ERROR-MODEL.md) | Error taxonomy, propagation rules, retry policies across all components |
+| [Verification Model](docs/VERIFICATION-MODEL.md) | How LOOM proves convergence: desired state matches observed state |
+| [Audit Model](docs/AUDIT-MODEL.md) | Compliance audit trail: who did what, when, to which device, with what result |
+| [API Conventions](docs/API-CONVENTIONS.md) | REST API versioning, pagination, filtering, error response contracts |
+| [Request-to-Device Flow](docs/REQUEST-TO-DEVICE-FLOW.md) | End-to-end orchestration path from user intent to verified device state |
 
-## Status
+### Security
+| Document | Description |
+|----------|-------------|
+| [Security Model](docs/SECURITY-MODEL.md) | Threat model, authentication, authorization, network segmentation |
+| [Vault Architecture](docs/VAULT-ARCHITECTURE.md) | Envelope encryption, memory protection, hardware acceleration, key rotation |
+| [LLM Boundaries](docs/LLM-BOUNDARIES.md) | Hard rules: LLM suggests, never executes — enforced in code, not policy |
+| [Failure Modes](docs/FAILURE-MODES.md) | Every failure mode cataloged: detection, impact, automatic response, operator action |
+| [Attack Surfaces](docs/security/) | 71 vectors across 8 surfaces with exploit and defense code |
 
-Early stage — architecture and design phase. Competitive landscape research complete.
+### Operations
+| Document | Description |
+|----------|-------------|
+| [Implementation Plan](docs/IMPLEMENTATION-PLAN.md) | 12-phase roadmap from contracts to production (v3, AI-reviewed) |
+| [Testing Strategy](docs/TESTING-STRATEGY.md) | Unit through E2E against simulated device fleets — all must pass before merge |
+
+### Architecture Decision Records
+| ADR | Decision |
+|-----|----------|
+| [ADR-001](docs/adr/ADR-001-go-language.md) | Go as primary language |
+| [ADR-002](docs/adr/ADR-002-temporal-workflow.md) | Temporal for workflow orchestration |
+| [ADR-003](docs/adr/ADR-003-nats-jetstream.md) | NATS JetStream for messaging |
+| [ADR-004](docs/adr/ADR-004-postgresql-database.md) | PostgreSQL as primary database |
+| [ADR-005](docs/adr/ADR-005-tenant-scoping.md) | Tenant scoping from day one |
+| [ADR-006](docs/adr/ADR-006-adapter-families.md) | Operation-family adapter model |
+| [ADR-007](docs/adr/ADR-007-llm-boundaries.md) | LLM suggests, never executes |
+| [ADR-008](docs/adr/ADR-008-temporal-truth-db-projection.md) | Temporal as execution truth, database as projection |
+| [ADR-009](docs/adr/ADR-009-identity-model.md) | DeviceID + ExternalIdentity with confidence |
+| [ADR-010](docs/adr/ADR-010-verification-mandatory.md) | Verification is mandatory |
+| [ADR-011](docs/adr/ADR-011-vault-architecture.md) | Enterprise-grade vault with hardware-accelerated encryption |
+
+### Research
+| Document | Scope |
+|----------|-------|
+| [Cloud-Native Orchestrators](research/01-cloud-native-orchestrators.md) | Kubernetes, Nomad, OpenShift, Rancher, Tanzu, Docker Swarm, Mesos |
+| [IaC & Provisioning](research/02-iac-provisioning-tools.md) | Terraform, Pulumi, Crossplane, Ansible, CloudFormation, SaltStack |
+| [Workflow Orchestrators](research/03-workflow-orchestrators.md) | Airflow, Temporal, Prefect, Argo, Dagster, Step Functions, NiFi |
+| [Network & Bare Metal](research/04-network-bare-metal-orchestrators.md) | Cisco NSO, MAAS, Tinkerbell, Ironic, NetBox, Apstra, CloudVision |
+| [Meta-Orchestrators](research/05-meta-orchestrators.md) | Backstage, Kratix, Humanitec, Port, Upbound, Spacelift |
+| [AI/LLM-Driven Ops](research/06-ai-llm-driven-ops.md) | Kubiya, Sedai, Cast.ai, Harness, Dynatrace Davis, Karpenter |
+| [FinOps & Cost](research/07-finops-cost-platforms.md) | CloudHealth, Kubecost, Infracost, Vantage, OpenCost, Spot.io |
+| [Observability](research/08-observability-platforms.md) | Datadog, Grafana, New Relic, Splunk, Dynatrace, Zabbix |
+| [Remote Management](research/09-remote-management-protocols.md) | IPMI, Redfish, Intel AMT, PiKVM, iDRAC, iLO, SNMP, NETCONF, gNMI |
+| [Network OS & Switches](research/10-network-os-switch-platforms.md) | SONiC, Cumulus, Cisco IOS/NX-OS/ACI, Junos, EOS, MikroTik, VyOS |
+| [Tech Stack Research](research/tech-stack/) | Language, data store, LLM, workflow engine, UI framework evaluations |
+
+---
 
 ## License
 
